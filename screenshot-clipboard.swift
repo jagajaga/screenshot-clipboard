@@ -43,30 +43,9 @@ let stateFile = (stateDir as NSString).appendingPathComponent("com.screenshotcli
 let RESCAN_SECONDS = 10.0
 let FRESH_WINDOW = 15.0
 
-// TEMPORARY debug logging: append every decision to /tmp for diagnosis.
-let dbgPath = "/tmp/screenshot-clipboard-debug.log"
-let dbgClock: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return f
-}()
-func dbg(_ s: String) {
-    let line = "\(dbgClock.string(from: Date())) [\(getpid())] \(s)\n"
-    if let h = FileHandle(forWritingAtPath: dbgPath) {
-        defer { try? h.close() }
-        h.seekToEndOfFile()
-        h.write(Data(line.utf8))
-    } else {
-        try? line.write(toFile: dbgPath, atomically: false, encoding: .utf8)
-    }
-}
-
 // Visible .png names only — a single directory read, no per-file stats.
 func listPNGs() -> [String]? {
-    guard let entries = try? fm.contentsOfDirectory(atPath: dir) else {
-        dbg("ERROR contentsOfDirectory failed for \(dir)")
-        return nil
-    }
+    guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
     return entries.filter { $0.lowercased().hasSuffix(".png") && !$0.hasPrefix(".") }
 }
 
@@ -102,7 +81,7 @@ let newestExisting = baselineNames.compactMap { mtime($0) }.max()
 lastCopied = max(persisted,
                  newestExisting?.timeIntervalSinceReferenceDate ?? -Double.greatestFiniteMagnitude)
 
-func handleChange(_ origin: String) {
+func handleChange() {
     guard let names = listPNGs() else { return }
     let fresh = names.filter { !knownNames.contains($0) }
     knownNames = Set(names)
@@ -117,7 +96,6 @@ func handleChange(_ origin: String) {
     guard let hit = best else { return }
     let age = Date().timeIntervalSince(hit.date)
     guard hit.date.timeIntervalSinceReferenceDate > lastCopied, age < FRESH_WINDOW else { return }
-    dbg("[\(origin)] candidate \(hit.name) age=\(String(format: "%.2f", age))s")
 
     let path = (dir as NSString).appendingPathComponent(hit.name)
 
@@ -128,17 +106,13 @@ func handleChange(_ origin: String) {
         if let data = fm.contents(atPath: path), isCompletePNG(data) {
             let pb = NSPasteboard.general
             pb.clearContents()
-            let ok = pb.setData(data, forType: .png)
-            dbg("COPIED \(data.count) bytes, setData=\(ok)")
+            pb.setData(data, forType: .png)
             copied = true
             break
         }
         usleep(100_000)   // 100 ms, up to ~2s total
     }
-    guard copied else {
-        dbg("EXIT never became a complete PNG")
-        return
-    }
+    guard copied else { return }
 
     // Record the newest mtime (a slow in-place writer may have bumped it).
     let finalDate = mtime(hit.name) ?? hit.date
@@ -158,7 +132,6 @@ var watchSource: DispatchSourceFileSystemObject?
 func startWatch() {
     let fd = open(dir, O_EVTONLY)
     guard fd >= 0 else {
-        dbg("ERROR open(\(dir)) failed, retrying in 5s")
         queue.asyncAfter(deadline: .now() + 5) { startWatch() }
         return
     }
@@ -167,10 +140,9 @@ func startWatch() {
     src.setEventHandler {
         let ev = src.data
         if ev.contains(.delete) || ev.contains(.rename) {
-            dbg("watch dir replaced, rearming")
             src.cancel()   // cancel handler closes fd and rearms
         } else {
-            handleChange("kqueue")
+            handleChange()
         }
     }
     src.setCancelHandler {
@@ -181,13 +153,12 @@ func startWatch() {
     watchSource = src
 }
 
-dbg("START resident dir=\(dir) known=\(knownNames.count) baseline=\(lastCopied)")
 startWatch()
 
 // Fallback rescan: catches anything a kqueue event might have missed.
 let rescan = DispatchSource.makeTimerSource(queue: queue)
 rescan.schedule(deadline: .now() + RESCAN_SECONDS, repeating: RESCAN_SECONDS)
-rescan.setEventHandler { handleChange("rescan") }
+rescan.setEventHandler { handleChange() }
 rescan.resume()
 
 _ = activity
