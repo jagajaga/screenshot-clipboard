@@ -6,11 +6,18 @@ import Foundation
 // Copies the most recently saved PNG screenshot to the clipboard, so a macOS
 // screenshot (⌘⇧4) becomes both a saved file AND a clipboard image.
 //
-// This is a one-shot program: it runs, copies, and exits. It is meant to be
-// launched by launchd every time the screenshot folder changes (see the
-// bundled launch agent, which uses `WatchPaths`). Keeping it short-lived means
-// there is no resident process to be suspended, sleep-stale, or App-Napped —
-// launchd does the watching and spawns a fresh copier per screenshot.
+// One-shot: launchd runs it (via the bundled `WatchPaths` agent) every time the
+// screenshot folder changes, and it exits after copying. Keeping it short-lived
+// means there is no resident process to go sleep-stale or be App-Napped.
+//
+// Two subtleties this handles:
+//   * launchd fires the moment the folder starts changing — often BEFORE macOS
+//     has finished writing the new file — so we briefly wait for it to appear
+//     rather than grabbing whatever was newest at that instant (the previous
+//     screenshot).
+//   * We remember the last file we copied (in a small state file) and only ever
+//     copy something strictly newer, so a screenshot is never copied twice and
+//     the "one before the last" is never picked.
 //
 // Usage:  screenshot-clipboard [watch-directory]
 // Default watch directory: ~/Screenshots
@@ -20,28 +27,49 @@ let dir = CommandLine.arguments.count > 1
     : (NSHomeDirectory() as NSString).appendingPathComponent("Screenshots")
 
 let fm = FileManager.default
-guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { exit(0) }
+let stateDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Caches")
+let stateFile = (stateDir as NSString).appendingPathComponent("com.screenshotclipboard.last")
 
-// Newest .png in the folder.
-var newestPath: String?
-var newestDate = Date.distantPast
-for name in entries where name.lowercased().hasSuffix(".png") {
-    let p = (dir as NSString).appendingPathComponent(name)
-    guard let attrs = try? fm.attributesOfItem(atPath: p),
-          let mdate = attrs[.modificationDate] as? Date else { continue }
-    if mdate > newestDate {
-        newestDate = mdate
-        newestPath = p
+func newestPNG() -> (path: String, date: Date)? {
+    guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+    var best: (String, Date)?
+    for name in entries where name.lowercased().hasSuffix(".png") {
+        let p = (dir as NSString).appendingPathComponent(name)
+        guard let a = try? fm.attributesOfItem(atPath: p),
+              let d = a[.modificationDate] as? Date else { continue }
+        if best == nil || d > best!.1 { best = (p, d) }
     }
+    return best.map { (path: $0.0, date: $0.1) }
 }
 
-guard let path = newestPath else { exit(0) }
+// Timestamp (seconds since reference date) of the screenshot we last copied.
+let lastCopied = (try? String(contentsOfFile: stateFile, encoding: .utf8))
+    .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    ?? -Double.greatestFiniteMagnitude
 
-// Only act on a just-created screenshot, so folder changes that aren't a new
-// screenshot (deletes, renames, .DS_Store churn) don't re-copy an old image.
-if Date().timeIntervalSince(newestDate) > 10 { exit(0) }
+// Wait (up to ~2s) for a PNG that is newer than the last one we copied and was
+// created just now — i.e. the screenshot that triggered this run, once it has
+// actually landed on disk.
+var target: (path: String, date: Date)?
+var waited = 0.0
+while waited <= 2.0 {
+    if let n = newestPNG(),
+       n.date.timeIntervalSinceReferenceDate > lastCopied,
+       Date().timeIntervalSince(n.date) < 15 {
+        target = n
+        break
+    }
+    usleep(120_000)   // 120 ms
+    waited += 0.12
+}
 
-guard let data = fm.contents(atPath: path) else { exit(0) }
+guard let hit = target, let data = fm.contents(atPath: hit.path) else { exit(0) }
+
 let pb = NSPasteboard.general
 pb.clearContents()
 pb.setData(data, forType: .png)
+
+// Record what we copied so the next run copies only something newer.
+try? fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+try? String(hit.date.timeIntervalSinceReferenceDate)
+    .write(toFile: stateFile, atomically: true, encoding: .utf8)
