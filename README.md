@@ -8,8 +8,8 @@ to choose one. This tiny background agent removes the choice: keep pressing
 `⌘⇧4` and every screenshot is instantly on your clipboard too, ready to `⌘V`.
 
 - **Native & tiny** — one small Swift binary, no dependencies, no menu-bar app.
-- **Event-driven** — `launchd` triggers it on each new screenshot; no polling, no resident process, no CPU when idle.
-- **Robust** — nothing stays running to go stale after sleep/wake; launchd does the watching and spawns a fresh copier per screenshot.
+- **Event-driven** — kqueue kernel events fire the instant a screenshot lands; effectively no CPU when idle.
+- **Robust** — kqueue events survive sleep/wake (unlike FSEvents streams), and a periodic rescan self-heals anything missed.
 
 ## Requirements
 
@@ -46,21 +46,24 @@ the script prints the one-liner to restore the default (`~/Desktop`) if you want
 ## How it works
 
 1. macOS saves screenshots to a folder (`defaults read com.apple.screencapture location`).
-2. A `launchd` agent watches that folder with **`WatchPaths`**. It is loaded at
-   login and stays armed by launchd itself — no process of ours is kept running.
-3. On each change, launchd runs the short-lived `screenshot-clipboard` binary,
-   which grabs the just-saved `.png` and puts it on the clipboard via
-   `NSPasteboard`, then exits.
+2. A `launchd` agent (`RunAtLoad` + `KeepAlive`) starts the watcher at login
+   and restarts it if it ever exits.
+3. The watcher holds a **kqueue** vnode dispatch source on the folder. When a
+   new `.png` lands, it puts it on the clipboard via `NSPasteboard`. A periodic
+   rescan acts as a fallback for any missed event, bounded by a freshness
+   window so it can never overwrite your clipboard with an old file.
 
 ```
-⌘⇧4  →  file saved to ~/Screenshots  →  launchd WatchPaths fires
-     →  screenshot-clipboard runs, copies the PNG, exits  →  ⌘V anywhere
+⌘⇧4  →  file saved to ~/Screenshots  →  kqueue fires instantly
+     →  screenshot-clipboard copies the PNG to the clipboard  →  ⌘V anywhere
 ```
 
-Why not a resident FSEvents watcher? A long-lived process that watches the
-folder itself works until the Mac sleeps or sits idle — then the event stream
-can go stale and silently stop. Letting launchd (which never sleeps) do the
-watching and spawn a fresh one-shot per screenshot avoids that entirely.
+Why this design? Screenshots are written as hidden temp files and renamed into
+place when complete (handled: hidden files are ignored, the rename is its own
+event). FSEvents streams can go stale after sleep/wake — kqueue is fd-based and
+kernel-level, so it doesn't. And `launchd WatchPaths` with a one-shot copier
+gets spawn-throttled (copies arrive 10-20s late). A resident kqueue watcher
+avoids all three failure modes.
 
 The launch agent lives in the repo; the installer symlinks it into
 `~/Library/LaunchAgents/` (the only place `launchd` auto-loads user agents from).
@@ -76,8 +79,8 @@ permissions, no fragility.
 ## Manage
 
 ```sh
-# is the agent loaded? (it runs on demand, so it won't show in `ps`)
-launchctl print gui/$(id -u)/com.screenshotclipboard
+# is it running?
+pgrep -fl screenshot-clipboard
 
 # reload after editing the agent
 launchctl bootout   gui/$(id -u)/com.screenshotclipboard
