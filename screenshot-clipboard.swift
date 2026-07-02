@@ -11,20 +11,20 @@ import Foundation
 // events that, unlike FSEvents streams, do not go stale after sleep/wake —
 // plus a periodic rescan as a fallback, so a missed event self-heals.
 //
-// Why not launchd WatchPaths + a one-shot copier? launchd throttles spawns
-// (observed 10-22s delays), so the clipboard lagged behind rapid screenshots.
-// A resident process reacts instantly.
-//
-// Subtleties handled:
-//   * macOS writes a screenshot as a HIDDEN dotfile (".Screenshot ….png") and
-//     renames it to the visible name when complete — hidden files are ignored
-//     (reading the temp mid-write yields corrupt data); the rename generates
-//     its own kqueue event.
-//   * Only a file strictly newer than the last one copied is taken, and only
-//     if freshly created — never a re-copy, never an old file, and the rescan
-//     fallback can never clobber the clipboard with something stale.
-//   * Before reading, wait until the file size is stable, for tools that
-//     write PNGs directly without the temp-then-rename dance.
+// Design notes, learned the hard way:
+//   * modern macOS composes the screenshot elsewhere and moves it into the
+//     folder ATOMICALLY — the file appears complete in a single event. So we
+//     validate completeness via the PNG's own end marker (IEND trailer)
+//     instead of sleeping and re-checking sizes.
+//   * stat-ing every file in a large folder on each event costs ~0.5-2s;
+//     being resident, we remember the folder's name-set and stat only names
+//     we haven't seen before.
+//   * launchd WatchPaths + a one-shot copier gets spawn-throttled (10-22s
+//     late); FSEvents streams go stale after sleep. Hence resident + kqueue.
+//   * hidden dotfiles (old-style ".Screenshot ….png" temps) are ignored.
+//   * only a file strictly newer than the last one copied is taken, and only
+//     if freshly created — never a re-copy, and the rescan fallback can never
+//     clobber the clipboard with something old.
 //
 // Usage:  screenshot-clipboard [watch-directory]
 // Default watch directory: ~/Screenshots
@@ -45,7 +45,11 @@ let FRESH_WINDOW = 15.0
 
 // TEMPORARY debug logging: append every decision to /tmp for diagnosis.
 let dbgPath = "/tmp/screenshot-clipboard-debug.log"
-let dbgClock = ISO8601DateFormatter()
+let dbgClock: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
 func dbg(_ s: String) {
     let line = "\(dbgClock.string(from: Date())) [\(getpid())] \(s)\n"
     if let h = FileHandle(forWritingAtPath: dbgPath) {
@@ -57,68 +61,90 @@ func dbg(_ s: String) {
     }
 }
 
-func newestPNG() -> (path: String, date: Date)? {
+// Visible .png names only — a single directory read, no per-file stats.
+func listPNGs() -> [String]? {
     guard let entries = try? fm.contentsOfDirectory(atPath: dir) else {
         dbg("ERROR contentsOfDirectory failed for \(dir)")
         return nil
     }
-    var best: (String, Date)?
-    for name in entries
-    where name.lowercased().hasSuffix(".png") && !name.hasPrefix(".") {
-        let p = (dir as NSString).appendingPathComponent(name)
-        guard let a = try? fm.attributesOfItem(atPath: p),
-              let d = a[.modificationDate] as? Date else { continue }
-        if best == nil || d > best!.1 { best = (p, d) }
-    }
-    return best.map { (path: $0.0, date: $0.1) }
+    return entries.filter { $0.lowercased().hasSuffix(".png") && !$0.hasPrefix(".") }
 }
 
-func fileSize(_ p: String) -> Int {
-    ((try? fm.attributesOfItem(atPath: p))?[.size] as? Int) ?? 0
+func mtime(_ name: String) -> Date? {
+    let p = (dir as NSString).appendingPathComponent(name)
+    return (try? fm.attributesOfItem(atPath: p))?[.modificationDate] as? Date
 }
+
+// Complete PNG = magic header at the front, IEND chunk trailer at the end.
+let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+let pngTrailer = Data([0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82])
+func isCompletePNG(_ d: Data) -> Bool {
+    d.count > 24 && d.prefix(8) == pngMagic && d.suffix(8) == pngTrailer
+}
+
+// --- state -------------------------------------------------------------
+// Names present at baseline or already handled; stat only what's new.
+// (Screenshots always get fresh names, so overwrites-in-place are ignored.)
+var knownNames: Set<String>
 
 // Timestamp (seconds since reference date) of the last screenshot copied.
-// Baseline on both the persisted state and whatever already exists, so neither
-// a restart nor pre-existing files ever cause a copy of something old.
+// Baseline on both the persisted state and whatever already exists, so
+// neither a restart nor pre-existing files cause a copy of something old.
+var lastCopied: Double
+
 let persisted = (try? String(contentsOfFile: stateFile, encoding: .utf8))
     .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     ?? -Double.greatestFiniteMagnitude
-var lastCopied = max(persisted, newestPNG()?.date.timeIntervalSinceReferenceDate
-    ?? -Double.greatestFiniteMagnitude)
+let baselineNames = listPNGs() ?? []
+knownNames = Set(baselineNames)
+// One full stat pass, at startup only.
+let newestExisting = baselineNames.compactMap { mtime($0) }.max()
+lastCopied = max(persisted,
+                 newestExisting?.timeIntervalSinceReferenceDate ?? -Double.greatestFiniteMagnitude)
 
 func handleChange(_ origin: String) {
-    guard let n = newestPNG() else { return }
-    let age = Date().timeIntervalSince(n.date)
-    guard n.date.timeIntervalSinceReferenceDate > lastCopied, age < FRESH_WINDOW else { return }
-    dbg("[\(origin)] candidate \((n.path as NSString).lastPathComponent) age=\(String(format: "%.1f", age))s")
+    guard let names = listPNGs() else { return }
+    let fresh = names.filter { !knownNames.contains($0) }
+    knownNames = Set(names)
+    guard !fresh.isEmpty else { return }
 
-    // Don't read until the size stops changing (and is nonzero).
-    var size = fileSize(n.path)
-    var stableWait = 0.0
-    while stableWait <= 3.0 {
-        usleep(150_000)   // 150 ms
-        let s2 = fileSize(n.path)
-        if s2 > 0 && s2 == size { break }
-        size = s2
-        stableWait += 0.15
+    // Stat only the new arrivals, take the newest.
+    var best: (name: String, date: Date)?
+    for n in fresh {
+        guard let d = mtime(n) else { continue }
+        if best == nil || d > best!.date { best = (n, d) }
     }
+    guard let hit = best else { return }
+    let age = Date().timeIntervalSince(hit.date)
+    guard hit.date.timeIntervalSinceReferenceDate > lastCopied, age < FRESH_WINDOW else { return }
+    dbg("[\(origin)] candidate \(hit.name) age=\(String(format: "%.2f", age))s")
 
-    guard let data = fm.contents(atPath: n.path) else {
-        dbg("EXIT could not read file contents")
+    let path = (dir as NSString).appendingPathComponent(hit.name)
+
+    // The file normally lands complete (atomic move); validate via the PNG
+    // trailer and retry briefly in case some tool writes it in place.
+    var copied = false
+    for _ in 0..<20 {
+        if let data = fm.contents(atPath: path), isCompletePNG(data) {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            let ok = pb.setData(data, forType: .png)
+            dbg("COPIED \(data.count) bytes, setData=\(ok)")
+            copied = true
+            break
+        }
+        usleep(100_000)   // 100 ms, up to ~2s total
+    }
+    guard copied else {
+        dbg("EXIT never became a complete PNG")
         return
     }
 
-    let pb = NSPasteboard.general
-    pb.clearContents()
-    let ok = pb.setData(data, forType: .png)
-
-    // Writes during the stability wait may have bumped the mtime past what we
-    // saw — record the latest so the next event can't mistake it for new.
-    let finalDate = ((try? fm.attributesOfItem(atPath: n.path))?[.modificationDate] as? Date) ?? n.date
-    lastCopied = max(finalDate, n.date).timeIntervalSinceReferenceDate
+    // Record the newest mtime (a slow in-place writer may have bumped it).
+    let finalDate = mtime(hit.name) ?? hit.date
+    lastCopied = max(finalDate, hit.date).timeIntervalSinceReferenceDate
     try? fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
     try? String(lastCopied).write(toFile: stateFile, atomically: true, encoding: .utf8)
-    dbg("COPIED \(data.count) bytes, setData=\(ok)")
 }
 
 // Keep macOS from App-Napping the watcher.
@@ -155,7 +181,7 @@ func startWatch() {
     watchSource = src
 }
 
-dbg("START resident dir=\(dir) baseline=\(lastCopied)")
+dbg("START resident dir=\(dir) known=\(knownNames.count) baseline=\(lastCopied)")
 startWatch()
 
 // Fallback rescan: catches anything a kqueue event might have missed.
