@@ -8,8 +8,8 @@ to choose one. This tiny background agent removes the choice: keep pressing
 `⌘⇧4` and every screenshot is instantly on your clipboard too, ready to `⌘V`.
 
 - **Native & tiny** — one small Swift binary, no dependencies, no menu-bar app.
-- **Event-driven** — uses FSEvents; zero polling, effectively no CPU when idle.
-- **Starts at login** — a `launchd` agent keeps it running and restarts it if it ever exits.
+- **Event-driven** — `launchd` triggers it on each new screenshot; no polling, no resident process, no CPU when idle.
+- **Robust** — nothing stays running to go stale after sleep/wake; launchd does the watching and spawns a fresh copier per screenshot.
 
 ## Requirements
 
@@ -46,15 +46,21 @@ the script prints the one-liner to restore the default (`~/Desktop`) if you want
 ## How it works
 
 1. macOS saves screenshots to a folder (`defaults read com.apple.screencapture location`).
-2. A `launchd` agent (`RunAtLoad` + `KeepAlive`) runs the `screenshot-clipboard`
-   binary at login and keeps it alive.
-3. The binary watches that folder via **FSEvents**. When a new `.png` appears it
-   reads the file and puts it on the clipboard via `NSPasteboard`.
+2. A `launchd` agent watches that folder with **`WatchPaths`**. It is loaded at
+   login and stays armed by launchd itself — no process of ours is kept running.
+3. On each change, launchd runs the short-lived `screenshot-clipboard` binary,
+   which grabs the just-saved `.png` and puts it on the clipboard via
+   `NSPasteboard`, then exits.
 
 ```
-⌘⇧4  →  file saved to ~/Screenshots  →  FSEvents fires
-     →  screenshot-clipboard copies the PNG to the clipboard  →  ⌘V anywhere
+⌘⇧4  →  file saved to ~/Screenshots  →  launchd WatchPaths fires
+     →  screenshot-clipboard runs, copies the PNG, exits  →  ⌘V anywhere
 ```
+
+Why not a resident FSEvents watcher? A long-lived process that watches the
+folder itself works until the Mac sleeps or sits idle — then the event stream
+can go stale and silently stop. Letting launchd (which never sleeps) do the
+watching and spawn a fresh one-shot per screenshot avoids that entirely.
 
 The launch agent lives in the repo; the installer symlinks it into
 `~/Library/LaunchAgents/` (the only place `launchd` auto-loads user agents from).
@@ -70,8 +76,8 @@ permissions, no fragility.
 ## Manage
 
 ```sh
-# is it running?
-pgrep -fl screenshot-clipboard
+# is the agent loaded? (it runs on demand, so it won't show in `ps`)
+launchctl print gui/$(id -u)/com.screenshotclipboard
 
 # reload after editing the agent
 launchctl bootout   gui/$(id -u)/com.screenshotclipboard
@@ -86,8 +92,9 @@ swiftc -O screenshot-clipboard.swift -o screenshot-clipboard
 - Handles PNG, the macOS default screenshot format. If you've switched formats
   (`defaults write com.apple.screencapture type jpg`), adjust the extension check
   in `screenshot-clipboard.swift`.
-- Only screenshots taken *after* the agent starts are copied; it never re-copies
-  older files in the folder.
+- Only a *just-saved* screenshot is copied: the copier ignores any file more
+  than ~10s old, so deletes, renames, or other folder churn never re-copy an
+  old image.
 
 ## License
 

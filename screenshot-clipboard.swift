@@ -1,65 +1,47 @@
 import AppKit
 import Foundation
-import CoreServices
 
 // screenshot-clipboard
 // ---------------------
-// Watches a folder and copies each newly-saved PNG screenshot to the clipboard,
-// so a macOS screenshot (⌘⇧4) becomes both a saved file AND a clipboard image.
+// Copies the most recently saved PNG screenshot to the clipboard, so a macOS
+// screenshot (⌘⇧4) becomes both a saved file AND a clipboard image.
+//
+// This is a one-shot program: it runs, copies, and exits. It is meant to be
+// launched by launchd every time the screenshot folder changes (see the
+// bundled launch agent, which uses `WatchPaths`). Keeping it short-lived means
+// there is no resident process to be suspended, sleep-stale, or App-Napped —
+// launchd does the watching and spawns a fresh copier per screenshot.
 //
 // Usage:  screenshot-clipboard [watch-directory]
 // Default watch directory: ~/Screenshots
-//
-// Runs as a resident process (see the launchd agent) using FSEvents; between
-// screenshots it sits idle with no polling.
 
 let dir = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : (NSHomeDirectory() as NSString).appendingPathComponent("Screenshots")
 
-func newestPNG() -> (path: String, date: Date)? {
-    let fm = FileManager.default
-    guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
-    var best: (String, Date)?
-    for name in entries where name.lowercased().hasSuffix(".png") {
-        let p = (dir as NSString).appendingPathComponent(name)
-        guard let a = try? fm.attributesOfItem(atPath: p),
-              let d = a[.modificationDate] as? Date else { continue }
-        if best == nil || d > best!.1 { best = (p, d) }
+let fm = FileManager.default
+guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { exit(0) }
+
+// Newest .png in the folder.
+var newestPath: String?
+var newestDate = Date.distantPast
+for name in entries where name.lowercased().hasSuffix(".png") {
+    let p = (dir as NSString).appendingPathComponent(name)
+    guard let attrs = try? fm.attributesOfItem(atPath: p),
+          let mdate = attrs[.modificationDate] as? Date else { continue }
+    if mdate > newestDate {
+        newestDate = mdate
+        newestPath = p
     }
-    return best.map { (path: $0.0, date: $0.1) }
 }
 
-// Baseline on whatever already exists, so we only copy screenshots taken
-// after this process starts — never re-copy an old one.
-var lastDate = newestPNG()?.date ?? Date.distantPast
+guard let path = newestPath else { exit(0) }
 
-func handleChange() {
-    guard let n = newestPNG(), n.date > lastDate else { return }
-    lastDate = n.date
-    guard let data = FileManager.default.contents(atPath: n.path) else { return }
-    let pb = NSPasteboard.general
-    pb.clearContents()
-    pb.setData(data, forType: .png)
-}
+// Only act on a just-created screenshot, so folder changes that aren't a new
+// screenshot (deletes, renames, .DS_Store churn) don't re-copy an old image.
+if Date().timeIntervalSince(newestDate) > 10 { exit(0) }
 
-let callback: FSEventStreamCallback = { _, _, _, _, _, _ in handleChange() }
-
-var context = FSEventStreamContext(version: 0, info: nil, retain: nil,
-                                   release: nil, copyDescription: nil)
-guard let stream = FSEventStreamCreate(
-    kCFAllocatorDefault,
-    callback,
-    &context,
-    [dir] as CFArray,
-    FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-    0.2,
-    FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)
-) else {
-    FileHandle.standardError.write(Data("screenshot-clipboard: failed to watch \(dir)\n".utf8))
-    exit(1)
-}
-
-FSEventStreamSetDispatchQueue(stream, DispatchQueue.global())
-FSEventStreamStart(stream)
-dispatchMain()
+guard let data = fm.contents(atPath: path) else { exit(0) }
+let pb = NSPasteboard.general
+pb.clearContents()
+pb.setData(data, forType: .png)

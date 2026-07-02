@@ -41,4 +41,5 @@ launchctl bootstrap "gui/$(id -u)" "$LINK"
 echo
 echo "✓ Installed. Watching: $WATCH_DIR"
 echo "  Take a screenshot (⌘⇧4), then paste (⌘V) to test."
-echo "  Status: pgrep -fl screenshot-clipboard"
+echo "  It runs on demand (no resident process); inspect it with:"
+echo "    launchctl print gui/\$(id -u)/$LABEL"

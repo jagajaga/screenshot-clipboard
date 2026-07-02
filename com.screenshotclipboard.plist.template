@@ -9,9 +9,9 @@
         <string>__BINARY__</string>
         <string>__WATCH_DIR__</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
+    <key>WatchPaths</key>
+    <array>
+        <string>__WATCH_DIR__</string>
+    </array>
 </dict>
 </plist>
